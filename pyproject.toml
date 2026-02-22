@@ -1,0 +1,21 @@
+[project]
+name = "comfyui-apiimage"
+description = "ComfyUI custom nodes for AI image generation via Gemini, Grok, Qwen, GLM, and OpenAI-compatible APIs"
+version = "1.1.0"
+license = "MIT"
+requires-python = ">= 3.10"
+dependencies = [
+    "google-genai>=1.0.0",
+    "xai_sdk>=1.5.0",
+    "dashscope>=1.17.0",
+    "Pillow>=9.0.0",
+    "requests>=2.28.0",
+]
+
+[project.urls]
+Repository = "https://github.com/user/comfyui-apiimage"
+
+[tool.comfy]
+PublisherId = "apiimage"
+DisplayName = "API Image Generator"
+Icon = ""
