@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-apiimage"
-description = "ComfyUI custom nodes for AI image generation via Gemini, Grok, Qwen, GLM, and OpenAI-compatible APIs"
-version = "1.1.0"
+description = "ComfyUI custom nodes for image generation and editing via Gemini, Grok, OpenAI, ModelArk, Qwen, and GLM APIs"
+version = "1.2.0"
 license = "MIT"
 requires-python = ">= 3.10"
 dependencies = [
@@ -19,3 +19,8 @@ Repository = "https://github.com/AyinMostima/ComfyUI-APIimage"
 PublisherId = "apiimage"
 DisplayName = "API Image Generator"
 Icon = ""
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["*.test.py", "*.spec.py"]
+addopts = ["--import-mode=importlib"]

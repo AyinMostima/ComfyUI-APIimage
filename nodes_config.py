@@ -13,6 +13,15 @@ from .config import (
 
 logger = logging.getLogger("ComfyUI-APIImage")
 
+API_TYPES = [
+    "Gemini Native",
+    "Grok API",
+    "OpenAI Compatible",
+    "BytePlus ModelArk",
+    "Qwen Image",
+    "GLM Image",
+]
+
 
 class APIImageConfigLoader:
     """
@@ -31,7 +40,7 @@ class APIImageConfigLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_type": (["Gemini Native", "Grok API", "OpenAI Compatible", "Qwen Image", "GLM Image"], {
+                "api_type": (API_TYPES, {
                     "default": "Gemini Native"
                 }),
             },
@@ -85,7 +94,7 @@ class APIImageConfigSaver:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "api_type": (["Gemini Native", "Grok API", "OpenAI Compatible", "Qwen Image", "GLM Image"], {
+                "api_type": (API_TYPES, {
                     "default": "Gemini Native"
                 }),
                 "api_key": ("STRING", {

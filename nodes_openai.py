@@ -1,42 +1,146 @@
 """
 OpenAI Compatible Image Generation node for ComfyUI.
 
-Uses HTTP REST API to generate images via DALL-E or any OpenAI-compatible endpoint.
+Uses HTTP REST API to generate images via GPT Image, DALL-E, or any
+OpenAI-compatible endpoint.
 Supports custom base_url for third-party providers.
 
-Reference: https://platform.openai.com/docs/api-reference/images/create
+Reference: https://developers.openai.com/api/reference/resources/images
 - POST /v1/images/generations
-- Request: model, prompt, n, size, response_format
+- POST /v1/images/edits
 - Response: data[].b64_json or data[].url
 """
 import base64
+import io
 import logging
+import re
 
 import requests
 
 from .config import get_api_config, get_model_list, BUILTIN_MODELS
-from .utils import tensor_to_pil, pil_to_tensor, mask_to_pil, bytes_to_tensor, sanitize_url, validate_ref_images
+from .utils import (
+    bytes_to_tensor,
+    mask_to_pil,
+    sanitize_url,
+    tensor_to_pil,
+    validate_ref_images,
+)
 
 logger = logging.getLogger("ComfyUI-APIImage")
 
 
-# Reference: https://platform.openai.com/docs/api-reference/images
+# Reference: https://developers.openai.com/api/reference/resources/images/methods/edit
 # dall-e-3: text-to-image only, no /images/edits support (0)
-# gpt-image-1: supports up to 16 reference images via /images/edits
+# GPT Image models: support up to 16 reference images via /images/edits
 # dall-e-2: supports 1 reference image via /images/edits
 MODEL_REF_IMAGE_LIMITS = {
     "dall-e-3": (0, 0),
+    "gpt-image-2": (0, 16),
+    "gpt-image-1.5": (0, 16),
     "gpt-image-1": (0, 16),
+    "gpt-image-1-mini": (0, 16),
+    "chatgpt-image-latest": (0, 16),
     "dall-e-2": (0, 1),
 }
+
+GPT_IMAGE_2_MIN_PIXELS = 655_360
+GPT_IMAGE_2_MAX_PIXELS = 8_294_400
+GPT_IMAGE_2_MAX_EDGE = 3_840
+
+
+def _is_gpt_image_model(model_name):
+    """Return whether a model uses the GPT Image request contract."""
+    normalized = (model_name or "").strip().lower()
+    return normalized.startswith("gpt-image-") or normalized == "chatgpt-image-latest"
+
+
+def _is_gpt_image_2(model_name):
+    """Return whether a model is GPT Image 2 or one of its snapshots."""
+    normalized = (model_name or "").strip().lower()
+    return normalized == "gpt-image-2" or normalized.startswith("gpt-image-2-")
+
+
+def _validate_gpt_image_2_size(size):
+    """Validate the flexible GPT Image 2 WIDTHxHEIGHT size contract."""
+    if size == "auto":
+        return
+
+    match = re.fullmatch(r"(\d+)x(\d+)", size or "")
+    if not match:
+        raise ValueError(
+            "[APIImage OpenAI] GPT-image-2 size must be 'auto' or WIDTHxHEIGHT."
+        )
+
+    width, height = (int(value) for value in match.groups())
+    pixels = width * height
+    edge_ratio = max(width, height) / min(width, height)
+    if (
+        width % 16 != 0
+        or height % 16 != 0
+        or max(width, height) > GPT_IMAGE_2_MAX_EDGE
+        or edge_ratio > 3
+        or pixels < GPT_IMAGE_2_MIN_PIXELS
+        or pixels > GPT_IMAGE_2_MAX_PIXELS
+    ):
+        raise ValueError(
+            "[APIImage OpenAI] GPT-image-2 size must use edges divisible by 16, "
+            "an aspect ratio no wider than 3:1, each edge at most 3840 px, and "
+            "655360-8294400 total pixels."
+        )
+
+
+def _collect_reference_images(ref_images, image1, image2, image3):
+    """Collect all ComfyUI image inputs while preserving their original sizes."""
+    images = []
+    for tensor in (ref_images, image1, image2, image3):
+        if tensor is not None:
+            images.extend(tensor_to_pil(tensor))
+    return images
+
+
+def _model_ref_limit(model_name):
+    """Resolve a known reference-image limit using the shared matching rules."""
+    normalized = (model_name or "").lower()
+    for known_model, bounds in MODEL_REF_IMAGE_LIMITS.items():
+        if known_model == normalized or known_model in normalized:
+            return bounds
+    return None
+
+
+def _add_request_options(
+    payload,
+    model_name,
+    quality,
+    output_format,
+    output_compression,
+    background,
+    moderation,
+):
+    """Add only parameters supported by the selected OpenAI model family."""
+    if _is_gpt_image_model(model_name):
+        payload["output_format"] = output_format
+        if quality != "auto":
+            payload["quality"] = quality
+        if output_format in {"jpeg", "webp"} and output_compression != 100:
+            payload["output_compression"] = output_compression
+        if background != "auto":
+            payload["background"] = background
+        if moderation != "auto":
+            payload["moderation"] = moderation
+        return
+
+    payload["response_format"] = "b64_json"
+    if quality != "auto":
+        payload["quality"] = quality
 
 
 class OpenAIImageGenerate:
     """
-    Generate images using OpenAI DALL-E or any OpenAI-compatible API.
+    Generate or edit images using GPT Image, legacy DALL-E, or compatible APIs.
 
     Supports custom base_url for third-party providers (e.g., Azure, proxy APIs).
-    Uses the standard /v1/images/generations endpoint.
+    Uses /v1/images/generations for text-only requests and /v1/images/edits
+    when one or more reference images are connected.
     """
 
     CATEGORY = "APIImage/OpenAI"
@@ -49,11 +153,13 @@ class OpenAIImageGenerate:
     def INPUT_TYPES(cls):
         models = get_model_list("OpenAI Compatible")
         if not models:
-            models = BUILTIN_MODELS.get("OpenAI Compatible", ["dall-e-3"])
+            models = BUILTIN_MODELS.get("OpenAI Compatible", ["gpt-image-2"])
 
         saved_config = get_api_config("OpenAI Compatible")
         saved_key = saved_config.get("api_key", "")
         saved_url = saved_config.get("base_url", "https://api.openai.com")
+        saved_model = saved_config.get("model_name", "")
+        default_model = saved_model if saved_model in models else models[0]
 
         return {
             "required": {
@@ -71,12 +177,17 @@ class OpenAIImageGenerate:
                     "placeholder": "https://api.openai.com"
                 }),
                 "model_name": (models, {
-                    "default": models[0] if models else "dall-e-3"
+                    "default": default_model if models else "gpt-image-2"
                 }),
                 "size": ([
+                    "auto",       # GPT Image automatic sizing
                     "1024x1024",  # Square (all models)
-                    "1024x1536",  # Portrait (gpt-image-1)
-                    "1536x1024",  # Landscape (gpt-image-1)
+                    "1024x1536",  # Portrait (GPT Image)
+                    "1536x1024",  # Landscape (GPT Image)
+                    "2048x2048",  # 2K square (GPT Image 2)
+                    "2048x1152",  # 2K landscape (GPT Image 2)
+                    "3840x2160",  # 4K landscape (GPT Image 2)
+                    "2160x3840",  # 4K portrait (GPT Image 2)
                     "1024x1792",  # Portrait (DALL-E 3)
                     "1792x1024",  # Landscape (DALL-E 3)
                     "512x512",    # DALL-E 2
@@ -89,9 +200,9 @@ class OpenAIImageGenerate:
                 "num_images": ("INT", {
                     "default": 1,
                     "min": 1,
-                    "max": 4,
+                    "max": 10,
                 }),
-                "quality": (["auto", "high", "standard"], {
+                "quality": (["auto", "low", "medium", "high", "standard", "hd"], {
                     "default": "auto"
                 }),
                 "ref_images": ("IMAGE",),
@@ -102,6 +213,24 @@ class OpenAIImageGenerate:
                 "custom_model": ("STRING", {
                     "default": "",
                     "placeholder": "Leave empty to use dropdown; fill to override"
+                }),
+                "custom_size": ("STRING", {
+                    "default": "",
+                    "placeholder": "GPT-image-2 override, for example 1536x864"
+                }),
+                "output_format": (["png", "jpeg", "webp"], {
+                    "default": "png"
+                }),
+                "output_compression": ("INT", {
+                    "default": 100,
+                    "min": 0,
+                    "max": 100,
+                }),
+                "background": (["auto", "opaque", "transparent"], {
+                    "default": "auto"
+                }),
+                "moderation": (["auto", "low"], {
+                    "default": "auto"
                 }),
                 "seed": ("INT", {
                     "default": 0,
@@ -118,19 +247,19 @@ class OpenAIImageGenerate:
     def generate(self, prompt, api_key, base_url, model_name, size, num_images=1,
                  quality="auto", ref_images=None,
                  image1=None, image2=None, image3=None,
-                 mask=None, custom_model="", seed=0):
+                 mask=None, custom_model="", seed=0,
+                 custom_size="", output_format="png", output_compression=100,
+                 background="auto", moderation="auto"):
         """
         Main execution function for OpenAI-compatible image generation.
 
-        Reference: https://platform.openai.com/docs/api-reference/images/create
+        Reference: https://developers.openai.com/api/reference/resources/images
         - Generation: POST {base_url}/v1/images/generations
-        - Inpainting: POST {base_url}/v1/images/edits (when image+mask provided)
-          - Request: multipart form data with image, mask, prompt, model, size, n
+        - Editing: POST {base_url}/v1/images/edits (when images are provided)
+          - Request: multipart form data with image(s), prompt, model, size, n
           - Mask: PNG with transparent (alpha=0) areas to edit
         - Response: { data: [{ b64_json: "..." }, ...] }
         """
-        import torch
-
         # --- Input Validation ---
         if not prompt or not prompt.strip():
             raise ValueError(
@@ -151,105 +280,152 @@ class OpenAIImageGenerate:
             )
 
         effective_model = custom_model.strip() if custom_model and custom_model.strip() else model_name
+        effective_size = custom_size.strip() if custom_size and custom_size.strip() else size
         clean_url = sanitize_url(base_url) or "https://api.openai.com"
+
+        if not effective_model or not effective_model.strip():
+            raise ValueError("[APIImage OpenAI] Model name is empty.")
+        if num_images < 1 or num_images > 10:
+            raise ValueError("[APIImage OpenAI] num_images must be between 1 and 10.")
+        if effective_model.lower() == "dall-e-3" and num_images != 1:
+            raise ValueError("[APIImage OpenAI] DALL-E 3 supports only num_images=1.")
+        if output_format not in {"png", "jpeg", "webp"}:
+            raise ValueError("[APIImage OpenAI] Invalid output_format.")
+        if not 0 <= output_compression <= 100:
+            raise ValueError("[APIImage OpenAI] output_compression must be 0-100.")
+        if background not in {"auto", "opaque", "transparent"}:
+            raise ValueError("[APIImage OpenAI] Invalid background option.")
+        if moderation not in {"auto", "low"}:
+            raise ValueError("[APIImage OpenAI] Invalid moderation option.")
+
+        if _is_gpt_image_model(effective_model):
+            if quality not in {"auto", "low", "medium", "high"}:
+                raise ValueError(
+                    "[APIImage OpenAI] GPT Image quality must be auto, low, medium, or high."
+                )
+        elif effective_model.lower() == "dall-e-3":
+            if quality not in {"auto", "standard", "hd"}:
+                raise ValueError(
+                    "[APIImage OpenAI] DALL-E 3 quality must be auto, standard, or hd."
+                )
+        elif effective_model.lower() == "dall-e-2" and quality not in {"auto", "standard"}:
+            raise ValueError(
+                "[APIImage OpenAI] DALL-E 2 quality must be auto or standard."
+            )
+
+        if _is_gpt_image_2(effective_model):
+            _validate_gpt_image_2_size(effective_size)
+            if background == "transparent":
+                raise ValueError(
+                    "[APIImage OpenAI] GPT-image-2 does not support transparent backgrounds."
+                )
 
         # --- Validate ref_images compatibility ---
         extra_img_count = sum(1 for s in [image1, image2, image3] if s is not None)
-        validate_ref_images("OpenAI", effective_model, ref_images, MODEL_REF_IMAGE_LIMITS, extra_count=extra_img_count)
+        validate_ref_images(
+            "OpenAI",
+            effective_model,
+            ref_images,
+            MODEL_REF_IMAGE_LIMITS,
+            extra_count=extra_img_count,
+        )
+        reference_images = _collect_reference_images(
+            ref_images,
+            image1,
+            image2,
+            image3,
+        )
+        ref_limit = _model_ref_limit(effective_model)
+        if ref_limit and ref_limit[1] > 0 and len(reference_images) > ref_limit[1]:
+            raise ValueError(
+                f"[APIImage OpenAI] Model '{effective_model}' supports at most "
+                f"{ref_limit[1]} reference images, but {len(reference_images)} were provided."
+            )
+        if mask is not None and not reference_images:
+            raise ValueError(
+                "[APIImage OpenAI] A mask requires at least one reference image."
+            )
 
         logger.info(
             f"[OpenAI] Starting generation | URL: {clean_url} | "
-            f"Model: {effective_model} | Size: {size} | NumImages: {num_images}"
+            f"Model: {effective_model} | Size: {effective_size} | NumImages: {num_images}"
         )
 
-        # --- Handle ref_images: use first image for inpainting ---
-        image = None
-        if ref_images is not None:
-            ref_pils = tensor_to_pil(ref_images)
-            if ref_pils:
-                if mask is None:
-                    logger.warning(
-                        f"[OpenAI] ref_images provided but no mask connected. "
-                        f"OpenAI /images/edits requires both image AND mask. "
-                        f"ref_images will be ignored for text-to-image generation."
-                    )
-                else:
-                    image = pil_to_tensor([ref_pils[0]])
-
-        # Check individual image slots (image1-3) as fallback if no ref_images
-        if image is None and mask is not None:
-            for slot_name, slot_val in [("image1", image1), ("image2", image2), ("image3", image3)]:
-                if slot_val is not None:
-                    try:
-                        slot_pils = tensor_to_pil(slot_val)
-                        if slot_pils:
-                            image = pil_to_tensor([slot_pils[0]])
-                            logger.info(f"[OpenAI] Using {slot_name} as inpaint source")
-                            break
-                    except Exception as e:
-                        logger.warning(f"[OpenAI] Failed to process {slot_name}: {e}")
-
-        # --- Determine mode: generation vs inpainting ---
-        is_inpaint = image is not None and mask is not None
-
-        if is_inpaint:
-            # === INPAINTING MODE: /v1/images/edits with multipart form data ===
-            import io
+        if reference_images:
+            # === EDITING MODE: /v1/images/edits with multipart form data ===
 
             url = f"{clean_url}/v1/images/edits"
-            logger.info(f"[OpenAI] INPAINT mode | URL: {url}")
+            logger.info(
+                f"[OpenAI] EDIT mode | URL: {url} | References: {len(reference_images)}"
+            )
 
             headers = {
                 "Authorization": f"Bearer {api_key.strip()}"
             }
 
-            # Convert image tensor to PNG bytes
-            pil_images = tensor_to_pil(image)
-            img_buf = io.BytesIO()
-            pil_images[0].save(img_buf, format="PNG")
-            img_buf.seek(0)
+            buffers = []
+            files = []
+            image_field = "image[]" if _is_gpt_image_model(effective_model) else "image"
+            for index, image in enumerate(reference_images):
+                image_buffer = io.BytesIO()
+                image.save(image_buffer, format="PNG")
+                image_buffer.seek(0)
+                buffers.append(image_buffer)
+                files.append(
+                    (
+                        image_field,
+                        (f"image_{index}.png", image_buffer, "image/png"),
+                    )
+                )
 
-            # Convert mask tensor to RGBA PNG (transparent areas = edit region)
-            mask_pil = mask_to_pil(mask)
-            # OpenAI expects RGBA mask where alpha=0 means edit area
-            mask_rgba = mask_pil.convert("RGBA")
-            # Invert: white (255) in mask -> transparent (alpha=0) in RGBA
-            import numpy as np
-            mask_arr = np.array(mask_rgba)
-            # Original mask: white=edit region, so alpha should be 0 where white
-            gray = np.array(mask_pil)
-            mask_arr[:, :, 3] = 255 - gray  # white->transparent, black->opaque
-            from PIL import Image as PILImage
-            mask_rgba = PILImage.fromarray(mask_arr, "RGBA")
-            mask_buf = io.BytesIO()
-            mask_rgba.save(mask_buf, format="PNG")
-            mask_buf.seek(0)
+            if mask is not None:
+                mask_pil = mask_to_pil(mask)
+                if mask_pil.size != reference_images[0].size:
+                    raise ValueError(
+                        "[APIImage OpenAI] Mask dimensions must match the first reference image."
+                    )
 
-            files = {
-                "image": ("image.png", img_buf, "image/png"),
-                "mask": ("mask.png", mask_buf, "image/png"),
-            }
+                import numpy as np
+                from PIL import Image as PILImage
+
+                mask_array = np.array(mask_pil.convert("RGBA"))
+                mask_array[:, :, 3] = 255 - np.array(mask_pil)
+                mask_rgba = PILImage.fromarray(mask_array, "RGBA")
+                mask_buffer = io.BytesIO()
+                mask_rgba.save(mask_buffer, format="PNG")
+                mask_buffer.seek(0)
+                buffers.append(mask_buffer)
+                files.append(("mask", ("mask.png", mask_buffer, "image/png")))
+
             data = {
                 "model": effective_model,
                 "prompt": prompt,
                 "n": str(num_images),
-                "size": size,
-                "response_format": "b64_json",
+                "size": effective_size,
             }
+            _add_request_options(
+                data,
+                effective_model,
+                quality,
+                output_format,
+                output_compression,
+                background,
+                moderation,
+            )
 
             try:
                 response = requests.post(url, headers=headers, files=files,
-                                         data=data, timeout=120)
+                                         data=data, timeout=300)
             except requests.exceptions.Timeout:
                 raise RuntimeError(
-                    f"[APIImage OpenAI] Inpainting request timed out after 120s."
+                    "[APIImage OpenAI] Editing request timed out after 300 seconds."
                 )
             except requests.exceptions.ConnectionError as e:
                 raise RuntimeError(
                     f"[APIImage OpenAI] Connection failed to {clean_url}. Error: {e}"
                 )
             except Exception as e:
-                raise RuntimeError(f"[APIImage OpenAI] Inpainting request failed: {e}")
+                raise RuntimeError(f"[APIImage OpenAI] Editing request failed: {e}")
 
         else:
             # === GENERATION MODE: /v1/images/generations with JSON ===
@@ -262,17 +438,23 @@ class OpenAIImageGenerate:
                 "model": effective_model,
                 "prompt": prompt,
                 "n": num_images,
-                "size": size,
-                "response_format": "b64_json"
+                "size": effective_size,
             }
-            if quality and quality != "auto":
-                payload["quality"] = quality
+            _add_request_options(
+                payload,
+                effective_model,
+                quality,
+                output_format,
+                output_compression,
+                background,
+                moderation,
+            )
 
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=120)
+                response = requests.post(url, headers=headers, json=payload, timeout=300)
             except requests.exceptions.Timeout:
                 raise RuntimeError(
-                    f"[APIImage OpenAI] Request timed out after 120 seconds. "
+                    f"[APIImage OpenAI] Request timed out after 300 seconds. "
                     f"Check your network connection or try a simpler prompt."
                 )
             except requests.exceptions.ConnectionError as e:
@@ -352,16 +534,15 @@ class OpenAIImageGenerate:
         # Convert bytes to tensor
         result_tensor = bytes_to_tensor(images_data)
 
-        # Extract token usage from OpenAI response
-        # OpenAI JSON response may contain: usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        # Extract current Image API usage with legacy-compatible fallbacks.
         usage_str = "N/A"
         try:
             usage = json_response.get("usage")
             if usage:
-                prompt_t = usage.get("prompt_tokens", 0)
-                completion_t = usage.get("completion_tokens", 0)
+                input_t = usage.get("input_tokens", usage.get("prompt_tokens", 0))
+                output_t = usage.get("output_tokens", usage.get("completion_tokens", 0))
                 total_t = usage.get("total_tokens", 0)
-                usage_str = f"Prompt: {prompt_t} | Completion: {completion_t} | Total: {total_t}"
+                usage_str = f"Input: {input_t} | Output: {output_t} | Total: {total_t}"
         except Exception:
             pass
 

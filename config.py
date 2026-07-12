@@ -21,13 +21,24 @@ BUILTIN_MODELS = {
         "gemini-3-pro-image-preview",
     ],
     "Grok API": [
+        "grok-imagine-image-quality",
         "grok-imagine-image",
         "grok-imagine-image-pro",
     ],
     "OpenAI Compatible": [
+        "gpt-image-2",
+        "gpt-image-2-2026-04-21",
         "dall-e-3",
         "dall-e-2",
         "gpt-image-1",
+    ],
+    "BytePlus ModelArk": [
+        "dola-seedream-5-0-pro-260628",
+        "seedream-5-0-260128",
+        "seedream-5-0-lite",
+        "seedream-4-5",
+        "seedream-4-0",
+        "seedream-3-0-t2i",
     ],
     "Qwen Image": [
         "qwen-image-plus",
@@ -50,13 +61,19 @@ DEFAULT_CONFIG = {
         "Grok API": {
             "api_key": "",
             "base_url": "https://api.x.ai",
-            "model_name": "grok-imagine-image-pro",
+            "model_name": "grok-imagine-image-quality",
             "custom_models": [],
         },
         "OpenAI Compatible": {
             "api_key": "",
             "base_url": "https://api.openai.com",
-            "model_name": "dall-e-3",
+            "model_name": "gpt-image-2",
+            "custom_models": [],
+        },
+        "BytePlus ModelArk": {
+            "api_key": "",
+            "base_url": "https://ark.ap-southeast.bytepluses.com/api/v3",
+            "model_name": "dola-seedream-5-0-pro-260628",
             "custom_models": [],
         },
         "Qwen Image": {

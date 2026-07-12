@@ -43,6 +43,10 @@ class GeminiImageGenerate:
     OUTPUT_NODE = True
     RETURN_TYPES = ("IMAGE", "STRING",)
     RETURN_NAMES = ("images", "text_response",)
+    # Allow returning a list of images with different resolutions.
+    # Each image is an independent [1,H,W,C] tensor - no resize, no distortion.
+    # Reference: https://docs.comfy.org/custom-nodes/backend/lists
+    OUTPUT_IS_LIST = (True, True,)
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -530,12 +534,35 @@ class GeminiImageGenerate:
                 f"[APIImage Gemini] Generation failed: {' | '.join(error_parts)}"
             )
 
-        # Convert bytes to ComfyUI IMAGE tensor
-        result_tensor = bytes_to_tensor(all_images_data)
+        # Convert bytes to list of individual IMAGE tensors.
+        # Each image keeps its original resolution (no resize / no distortion).
+        # OUTPUT_IS_LIST = (True, True) tells ComfyUI to treat each element
+        # as a separate execution for downstream nodes.
+        image_tensors = []
+        for img_idx, img_bytes in enumerate(all_images_data):
+            try:
+                single_tensor = bytes_to_tensor([img_bytes])  # [1, H, W, C]
+                image_tensors.append(single_tensor)
+                logger.info(
+                    f"[Gemini] Image {img_idx+1}/{len(all_images_data)} | "
+                    f"Size: {single_tensor.shape[1]}x{single_tensor.shape[2]}"
+                )
+            except Exception as e:
+                logger.error(f"[Gemini] Failed to decode image {img_idx+1}: {e}")
+
+        if not image_tensors:
+            raise RuntimeError(
+                "[APIImage Gemini] All generated images failed to decode."
+            )
+
         logger.info(
             f"[Gemini] Success | Model: {effective_model} | "
-            f"Images: {result_tensor.shape[0]} | Size: {result_tensor.shape[1]}x{result_tensor.shape[2]} | "
+            f"Images: {len(image_tensors)} | "
             f"Tokens(prompt/output/total): {total_prompt_tokens}/{total_output_tokens}/{total_all_tokens}"
         )
 
-        return (result_tensor, text_response,)
+        # OUTPUT_IS_LIST requires each output to be a list.
+        # text_response is duplicated for each image so downstream nodes
+        # always receive matched (image, text) pairs.
+        text_list = [text_response] * len(image_tensors)
+        return (image_tensors, text_list,)

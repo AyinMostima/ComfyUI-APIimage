@@ -66,6 +66,11 @@ def pil_to_tensor(pil_images):
     """
     Convert list of PIL Images to ComfyUI IMAGE tensor [B,H,W,C].
 
+    When images have different sizes, all images are resized to match the
+    first image's dimensions using Lanczos resampling. This follows
+    ComfyUI's built-in ImageBatch node convention.
+    Reference: https://docs.comfy.org/built-in-nodes/ImageBatch
+
     Args:
         pil_images: single PIL.Image or list of PIL.Image objects
 
@@ -78,11 +83,27 @@ def pil_to_tensor(pil_images):
     if not isinstance(pil_images, (list, tuple)):
         pil_images = [pil_images]
 
+    if not pil_images:
+        raise ValueError("pil_to_tensor received an empty image list")
+
     tensors = []
-    for img in pil_images:
+    target_size = None  # (width, height) of the first image
+    for idx, img in enumerate(pil_images):
         # Convert to RGB if needed
         if img.mode != "RGB":
             img = img.convert("RGB")
+
+        if target_size is None:
+            # Use the first image's dimensions as the reference
+            target_size = img.size  # PIL size is (width, height)
+        elif img.size != target_size:
+            # Resize to match the first image (ComfyUI ImageBatch convention)
+            logger.info(
+                f"[pil_to_tensor] Resizing image {idx} from {img.size} "
+                f"to {target_size} to match batch dimensions"
+            )
+            img = img.resize(target_size, Image.LANCZOS)
+
         # PIL -> numpy -> tensor
         img_np = np.array(img).astype(np.float32) / 255.0
         tensors.append(torch.from_numpy(img_np))
